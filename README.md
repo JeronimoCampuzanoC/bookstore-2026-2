@@ -1,5 +1,51 @@
 # BookStore Co.
 
+## Versión microservicios (proyecto final)
+
+El backend monolítico se dividió en cuatro microservicios desplegados en
+Amazon EKS:
+
+| Servicio | Rutas | Carpeta |
+|---|---|---|
+| auth-service | `/api/auth/*` | `services/auth-service` |
+| catalog-service | `/api/books/*` | `services/catalog-service` |
+| order-service | `/api/orders/*` | `services/order-service` |
+| events-service | `/api/events` | `services/events-service` |
+
+- **API Gateway:** APISIX en modo standalone. Las rutas están en
+  `gateway/apisix.yaml`.
+- **Patrón Sidecar:** cada Pod tiene la app y un contenedor Fluent Bit que
+  comparten un volumen `emptyDir`. La app escribe `clickstream.log` y el sidecar
+  lo envía a CloudWatch Logs.
+- **Base de datos:** los cuatro servicios comparten el mismo RDS PostgreSQL.
+- **Frontend:** la SPA se publica en Cloudflare Pages. La función
+  `frontend/functions/api/[[path]].js` reenvía `/api/*` al ALB de AWS.
+- **Infraestructura:** `infra/terraform/`.
+
+### Desplegar
+
+```bash
+cd infra/terraform
+terraform init
+terraform apply
+```
+
+```bash
+cd frontend
+npm ci
+VITE_API_BASE_URL=/ VITE_API_PREFIX=/api VITE_CURRENCY_LOCALE=es-CO VITE_CURRENCY_CODE=COP npm run build
+npx wrangler pages deploy dist --project-name bookstore-2026-2 --branch main
+```
+
+`API_ORIGIN` en `frontend/wrangler.toml` debe tener la URL del ALB
+(`terraform output api_url`). La tienda queda en
+https://bookstore-2026-2.pages.dev.
+
+El `backend/` original se conserva solo para el entorno local con
+`docker compose`.
+
+---
+
 Aplicación de referencia para el caso longitudinal del curso
 **Cloud Computing**.
 

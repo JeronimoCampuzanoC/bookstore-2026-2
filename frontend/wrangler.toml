@@ -1,0 +1,8 @@
+# Cloudflare Pages: la SPA (dist/) y la función que reenvía /api/* a AWS
+name = "bookstore-2026-2"
+pages_build_output_dir = "dist"
+compatibility_date = "2026-11-01"
+
+[vars]
+# URL del ALB de AWS (terraform output api_url)
+API_ORIGIN = "http://k8s-bookstor-webingre-724606441f-587525145.us-west-2.elb.amazonaws.com"

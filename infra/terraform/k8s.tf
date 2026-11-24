@@ -3,22 +3,21 @@ locals {
 
   backend_env = {
     NODE_ENV                     = "production"
-    SERVICE_NAME                 = "bookstore-api"
     PORT                         = "5001"
     API_BASE_PATH                = "/api"
-    CORS_ORIGINS                 = "http://${kubernetes_ingress_v1.web.status[0].load_balancer[0].ingress[0].hostname}"
+    CORS_ORIGINS                 = var.frontend_url
     BOOKS_DEFAULT_LIMIT          = "24"
     BOOKS_MAX_LIMIT              = "100"
     ORDERS_MAX_DISTINCT_ITEMS    = "100"
     ORDERS_MAX_QUANTITY_PER_ITEM = "1000"
-    HTTP_TRUST_PROXY_HOPS        = "1" # ALB
+    HTTP_TRUST_PROXY_HOPS        = "2" # ALB + APISIX
     HTTP_JSON_BODY_LIMIT         = "32kb"
     ACCESS_LOG_ENABLED           = "true"
     ACCESS_LOG_EXCLUDE_PATHS     = "/health"
     ACCESS_LOG_MAX_FIELD_LENGTH  = "2048"
     ACCESS_LOG_REQUEST_ID_HEADER = "X-Request-Id"
-    # El access log/clickstream ya sale por stdout y Fluent Bit lo recolecta.
-    CLICKSTREAM_FILE_ENABLED = "false"
+    # El clickstream se escribe en un archivo (emptyDir) que lee el sidecar Fluent Bit.
+    CLICKSTREAM_FILE_ENABLED = "true"
     CLICKSTREAM_FILE_PATH    = "/usr/src/app/logs/clickstream.log"
 
     DB_HOST                    = aws_db_instance.master.address
@@ -47,9 +46,9 @@ resource "kubernetes_namespace_v1" "app" {
   depends_on = [aws_eks_node_group.this]
 }
 
-resource "kubernetes_secret_v1" "backend" {
+resource "kubernetes_secret_v1" "app" {
   metadata {
-    name      = "backend-secrets"
+    name      = "app-secrets"
     namespace = kubernetes_namespace_v1.app.metadata[0].name
   }
   data = {
@@ -190,23 +189,31 @@ resource "kubernetes_job_v1" "db_bootstrap" {
   depends_on = [aws_db_instance.master]
 }
 
-# ---------- Backend ----------
-resource "kubernetes_deployment_v1" "backend" {
+# ---------- Microservicios (cada Pod = app + sidecar Fluent Bit) ----------
+resource "kubernetes_deployment_v1" "service" {
+  for_each = toset(local.services)
+
   metadata {
-    name      = "backend"
+    name      = each.key
     namespace = kubernetes_namespace_v1.app.metadata[0].name
-    labels    = { app = "backend" }
+    labels    = { app = each.key }
   }
 
   spec {
-    replicas = var.backend_replicas
+    replicas = var.replicas
 
     selector {
-      match_labels = { app = "backend" }
+      match_labels = { app = each.key }
     }
 
     template {
-      metadata { labels = { app = "backend" } }
+      metadata {
+        labels = { app = each.key }
+        annotations = {
+          # Si cambia la configuración del sidecar, los Pods se reinician
+          sidecar-config-hash = sha1(jsonencode(kubernetes_config_map_v1.sidecar.data))
+        }
+      }
 
       spec {
         topology_spread_constraint {
@@ -214,27 +221,28 @@ resource "kubernetes_deployment_v1" "backend" {
           topology_key       = "topology.kubernetes.io/zone"
           when_unsatisfiable = "ScheduleAnyway"
           label_selector {
-            match_labels = { app = "backend" }
+            match_labels = { app = each.key }
           }
         }
 
+        # Contenedor principal: el microservicio
         container {
-          name  = "backend"
-          image = local.backend_image
+          name  = "app"
+          image = "${aws_ecr_repository.service[each.key].repository_url}:${var.image_tag}"
 
           port {
             container_port = 5001
           }
 
           dynamic "env" {
-            for_each = local.backend_env
+            for_each = merge(local.backend_env, { SERVICE_NAME = each.key })
             content {
               name  = env.key
               value = env.value
             }
           }
           env_from {
-            secret_ref { name = kubernetes_secret_v1.backend.metadata[0].name }
+            secret_ref { name = kubernetes_secret_v1.app.metadata[0].name }
           }
 
           readiness_probe {
@@ -250,25 +258,64 @@ resource "kubernetes_deployment_v1" "backend" {
             requests = { cpu = "100m", memory = "128Mi" }
             limits   = { memory = "512Mi" }
           }
+
+          # Aquí escribe clickstream.log
+          volume_mount {
+            name       = "logs"
+            mount_path = "/usr/src/app/logs"
+          }
+        }
+
+        # Sidecar: lee el log del volumen compartido y lo envía a CloudWatch
+        container {
+          name  = "fluent-bit"
+          image = var.fluent_bit_image
+
+          resources {
+            requests = { cpu = "20m", memory = "32Mi" }
+            limits   = { memory = "128Mi" }
+          }
+
+          volume_mount {
+            name       = "logs"
+            mount_path = "/logs"
+            read_only  = true
+          }
+          volume_mount {
+            name       = "fluent-bit-config"
+            mount_path = "/fluent-bit/etc/fluent-bit.conf"
+            sub_path   = "fluent-bit.conf"
+          }
+        }
+
+        # Volumen compartido entre la app y el sidecar (vive lo mismo que el Pod)
+        volume {
+          name = "logs"
+          empty_dir {}
+        }
+        volume {
+          name = "fluent-bit-config"
+          config_map {
+            name = kubernetes_config_map_v1.sidecar.metadata[0].name
+          }
         }
       }
     }
   }
 
-  depends_on = [null_resource.backend_image, kubernetes_job_v1.db_bootstrap]
+  depends_on = [null_resource.service_image, kubernetes_job_v1.db_bootstrap]
 }
 
-resource "kubernetes_service_v1" "backend" {
+resource "kubernetes_service_v1" "service" {
+  for_each = toset(local.services)
+
   metadata {
-    name      = "backend-service"
+    name      = each.key
     namespace = kubernetes_namespace_v1.app.metadata[0].name
-    annotations = {
-      "alb.ingress.kubernetes.io/healthcheck-path" = "/health"
-    }
   }
   spec {
     type     = "ClusterIP"
-    selector = { app = "backend" }
+    selector = { app = each.key }
     port {
       port        = 5001
       target_port = 5001
@@ -276,91 +323,103 @@ resource "kubernetes_service_v1" "backend" {
   }
 }
 
-# ---------- Frontend (Nginx + SPA) ----------
-resource "kubernetes_deployment_v1" "frontend" {
+# ---------- API Gateway: APISIX en modo standalone (rutas en gateway/apisix.yaml) ----------
+resource "kubernetes_config_map_v1" "apisix_routes" {
   metadata {
-    name      = "frontend"
+    name      = "apisix-routes"
     namespace = kubernetes_namespace_v1.app.metadata[0].name
-    labels    = { app = "frontend" }
+  }
+  data = {
+    "apisix.yaml" = file("${var.app_source_dir}/gateway/apisix.yaml")
+  }
+}
+
+resource "kubernetes_deployment_v1" "apisix" {
+  metadata {
+    name      = "apisix"
+    namespace = kubernetes_namespace_v1.app.metadata[0].name
+    labels    = { app = "apisix" }
   }
 
   spec {
-    replicas = var.backend_replicas
+    replicas = var.replicas
 
     selector {
-      match_labels = { app = "frontend" }
+      match_labels = { app = "apisix" }
     }
 
     template {
-      metadata { labels = { app = "frontend" } }
+      metadata {
+        labels = { app = "apisix" }
+        annotations = {
+          # Si cambian las rutas, Kubernetes reinicia APISIX de forma gradual
+          routes-hash = sha1(kubernetes_config_map_v1.apisix_routes.data["apisix.yaml"])
+        }
+      }
 
       spec {
-        topology_spread_constraint {
-          max_skew           = 1
-          topology_key       = "topology.kubernetes.io/zone"
-          when_unsatisfiable = "ScheduleAnyway"
-          label_selector {
-            match_labels = { app = "frontend" }
-          }
-        }
-
         container {
-          name  = "frontend"
-          image = local.frontend_image
+          name  = "apisix"
+          image = var.apisix_image
+
+          # Modo standalone: sin etcd, lee las rutas de conf/apisix.yaml
+          env {
+            name  = "APISIX_STAND_ALONE"
+            value = "true"
+          }
 
           port {
-            container_port = 80
-          }
-
-          env {
-            name  = "NGINX_PORT"
-            value = "80"
-          }
-          env {
-            name  = "API_PROXY_PREFIX"
-            value = "/api"
-          }
-          env {
-            name  = "PROXY_PASS"
-            value = "http://backend-service:5001"
+            container_port = 9080
           }
 
           readiness_probe {
-            http_get {
-              path = "/"
-              port = 80
+            tcp_socket {
+              port = 9080
             }
             period_seconds = 10
           }
 
           resources {
-            requests = { cpu = "50m", memory = "64Mi" }
-            limits   = { memory = "256Mi" }
+            requests = { cpu = "100m", memory = "128Mi" }
+            limits   = { memory = "512Mi" }
+          }
+
+          volume_mount {
+            name       = "routes"
+            mount_path = "/usr/local/apisix/conf/apisix.yaml"
+            sub_path   = "apisix.yaml"
+          }
+        }
+
+        volume {
+          name = "routes"
+          config_map {
+            name = kubernetes_config_map_v1.apisix_routes.metadata[0].name
           }
         }
       }
     }
   }
 
-  depends_on = [null_resource.frontend_image]
+  depends_on = [kubernetes_deployment_v1.service]
 }
 
-resource "kubernetes_service_v1" "frontend" {
+resource "kubernetes_service_v1" "apisix" {
   metadata {
-    name      = "frontend-service"
+    name      = "apisix-gateway"
     namespace = kubernetes_namespace_v1.app.metadata[0].name
   }
   spec {
     type     = "ClusterIP"
-    selector = { app = "frontend" }
+    selector = { app = "apisix" }
     port {
-      port        = 80
-      target_port = 80
+      port        = 9080
+      target_port = 9080
     }
   }
 }
 
-# ---------- ALB (aws-load-balancer-controller) ----------
+# ---------- ALB (aws-load-balancer-controller): todo el tráfico va a APISIX ----------
 resource "kubernetes_ingress_v1" "web" {
   metadata {
     name      = "web-ingress"
@@ -369,6 +428,8 @@ resource "kubernetes_ingress_v1" "web" {
       "alb.ingress.kubernetes.io/scheme"           = "internet-facing"
       "alb.ingress.kubernetes.io/target-type"      = "ip"
       "alb.ingress.kubernetes.io/healthcheck-path" = "/"
+      # APISIX responde 404 en "/" (no hay ruta), y eso basta para saber que está vivo
+      "alb.ingress.kubernetes.io/success-codes" = "200-404"
     }
   }
 
@@ -378,22 +439,12 @@ resource "kubernetes_ingress_v1" "web" {
     rule {
       http {
         path {
-          path      = "/api"
-          path_type = "Prefix"
-          backend {
-            service {
-              name = kubernetes_service_v1.backend.metadata[0].name
-              port { number = 5001 }
-            }
-          }
-        }
-        path {
           path      = "/"
           path_type = "Prefix"
           backend {
             service {
-              name = kubernetes_service_v1.frontend.metadata[0].name
-              port { number = 80 }
+              name = kubernetes_service_v1.apisix.metadata[0].name
+              port { number = 9080 }
             }
           }
         }

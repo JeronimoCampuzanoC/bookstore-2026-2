@@ -1,5 +1,6 @@
-output "app_url" {
-  value = "http://${kubernetes_ingress_v1.web.status[0].load_balancer[0].ingress[0].hostname}"
+output "api_url" {
+  description = "ALB público (APISIX). La Pages Function de Cloudflare reenvía /api/* aquí."
+  value       = "http://${kubernetes_ingress_v1.web.status[0].load_balancer[0].ingress[0].hostname}"
 }
 
 output "kubeconfig_command" {
@@ -14,12 +15,8 @@ output "log_group" {
   value = aws_cloudwatch_log_group.backend.name
 }
 
-output "ecr_backend" {
-  value = aws_ecr_repository.backend.repository_url
-}
-
-output "ecr_frontend" {
-  value = aws_ecr_repository.frontend.repository_url
+output "ecr_repositories" {
+  value = { for s in local.services : s => aws_ecr_repository.service[s].repository_url }
 }
 
 output "rds_master" {

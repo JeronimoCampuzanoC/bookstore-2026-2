@@ -1,64 +1,46 @@
 locals {
-  backend_dir  = "${var.app_source_dir}/backend"
-  frontend_dir = "${var.app_source_dir}/frontend"
+  # Un microservicio por carpeta en services/
+  services     = ["auth-service", "catalog-service", "order-service", "events-service"]
   ecr_registry = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com"
-
-  backend_image  = "${aws_ecr_repository.backend.repository_url}:${var.image_tag}"
-  frontend_image = "${aws_ecr_repository.frontend.repository_url}:${var.image_tag}"
-
-  backend_hash = sha1(join("", [
-    for f in sort(fileset(local.backend_dir, "**")) :
-    filesha1("${local.backend_dir}/${f}") if !strcontains(f, "node_modules")
-  ]))
-  frontend_hash = sha1(join("", [
-    for f in sort(fileset(local.frontend_dir, "**")) :
-    filesha1("${local.frontend_dir}/${f}") if !strcontains(f, "node_modules") && !startswith(f, "dist/")
-  ]))
 }
 
-resource "aws_ecr_repository" "backend" {
-  name         = "${local.name}-backend"
+resource "aws_ecr_repository" "service" {
+  for_each     = toset(local.services)
+  name         = "${local.name}-${each.key}"
   force_delete = true
 }
 
-resource "aws_ecr_repository" "frontend" {
-  name         = "${local.name}-frontend"
-  force_delete = true
-}
-
-# Construyen (linux/amd64) y publican las imágenes en ECR.
-resource "null_resource" "backend_image" {
-  triggers = { src = local.backend_hash, tag = var.image_tag, repo = aws_ecr_repository.backend.repository_url }
+# Login a ECR una sola vez (si cada imagen hace su propio login al mismo tiempo,
+# chocan en el llavero de macOS).
+resource "null_resource" "ecr_login" {
+  triggers = { always = timestamp() }
 
   provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      set -euo pipefail
-      aws ecr get-login-password --region ${var.region} | docker login --username AWS --password-stdin ${local.ecr_registry}
-      docker build --platform linux/amd64 --build-arg NODE_IMAGE=node:24-alpine -t ${local.backend_image} ${local.backend_dir}
-      docker push ${local.backend_image}
-    EOT
+    command = "aws ecr get-login-password --region ${var.region} | docker login --username AWS --password-stdin ${local.ecr_registry}"
   }
 }
 
-# SPA compilada con rutas relativas: el navegador llama a /api en el mismo ALB.
-resource "null_resource" "frontend_image" {
-  triggers = { src = local.frontend_hash, tag = var.image_tag, repo = aws_ecr_repository.frontend.repository_url }
+# Construye (linux/amd64) y publica la imagen de cada microservicio en ECR.
+# Se vuelve a construir si cambia algún archivo de la carpeta del servicio.
+resource "null_resource" "service_image" {
+  for_each   = toset(local.services)
+  depends_on = [null_resource.ecr_login]
+
+  triggers = {
+    src = sha1(join("", [
+      for f in sort(fileset("${var.app_source_dir}/services/${each.key}", "**")) :
+      filesha1("${var.app_source_dir}/services/${each.key}/${f}") if !strcontains(f, "node_modules")
+    ]))
+    tag  = var.image_tag
+    repo = aws_ecr_repository.service[each.key].repository_url
+  }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -euo pipefail
-      aws ecr get-login-password --region ${var.region} | docker login --username AWS --password-stdin ${local.ecr_registry}
-      docker build --platform linux/amd64 \
-        --build-arg NODE_IMAGE=node:24-alpine \
-        --build-arg NGINX_IMAGE=nginx:1.27-alpine \
-        --build-arg VITE_API_BASE_URL=/ \
-        --build-arg VITE_API_PREFIX=/api \
-        --build-arg VITE_CURRENCY_LOCALE=${var.currency_locale} \
-        --build-arg VITE_CURRENCY_CODE=${var.currency_code} \
-        -t ${local.frontend_image} ${local.frontend_dir}
-      docker push ${local.frontend_image}
+      docker build --platform linux/amd64 --build-arg NODE_IMAGE=node:24-alpine -t ${aws_ecr_repository.service[each.key].repository_url}:${var.image_tag} ${var.app_source_dir}/services/${each.key}
+      docker push ${aws_ecr_repository.service[each.key].repository_url}:${var.image_tag}
     EOT
   }
 }

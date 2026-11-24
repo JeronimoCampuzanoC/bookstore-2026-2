@@ -28,12 +28,24 @@ variable "app_source_dir" {
 
 variable "image_tag" {
   type    = string
-  default = "8.1.0"
+  default = "1.0.0"
 }
 
-variable "backend_replicas" {
-  type    = number
-  default = 2
+variable "replicas" {
+  description = "Réplicas de cada microservicio y de APISIX."
+  type        = number
+  default     = 2
+}
+
+variable "frontend_url" {
+  description = "URL de Cloudflare Pages donde vive la SPA (origen permitido por CORS)."
+  type        = string
+  default     = "https://bookstore-2026-2.pages.dev"
+}
+
+variable "apisix_image" {
+  type    = string
+  default = "apache/apisix:3.11.0-debian"
 }
 
 variable "db_instance_class" {
@@ -59,14 +71,4 @@ variable "node_instance_type" {
 variable "alb_controller_chart_version" {
   type    = string
   default = "3.6.1"
-}
-
-variable "currency_locale" {
-  type    = string
-  default = "es-CO"
-}
-
-variable "currency_code" {
-  type    = string
-  default = "COP"
 }

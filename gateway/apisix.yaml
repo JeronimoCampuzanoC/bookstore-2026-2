@@ -1,0 +1,35 @@
+# Rutas de APISIX en modo standalone (sin etcd).
+# Para agregar un microservicio: un upstream nuevo y su ruta.
+
+upstreams:
+  - id: auth
+    type: roundrobin
+    nodes:
+      "auth-service.bookstore.svc.cluster.local:5001": 1
+  - id: catalog
+    type: roundrobin
+    nodes:
+      "catalog-service.bookstore.svc.cluster.local:5001": 1
+  - id: order
+    type: roundrobin
+    nodes:
+      "order-service.bookstore.svc.cluster.local:5001": 1
+  - id: events
+    type: roundrobin
+    nodes:
+      "events-service.bookstore.svc.cluster.local:5001": 1
+
+routes:
+  - id: auth
+    uris: ["/api/auth", "/api/auth/*"]
+    upstream_id: auth
+  - id: catalog
+    uris: ["/api/books", "/api/books/*"]
+    upstream_id: catalog
+  - id: order
+    uris: ["/api/orders", "/api/orders/*"]
+    upstream_id: order
+  - id: events
+    uris: ["/api/events", "/api/events/*"]
+    upstream_id: events
+#END

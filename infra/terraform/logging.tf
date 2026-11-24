@@ -1,11 +1,6 @@
-# Pods -> Fluent Bit (DaemonSet) -> CloudWatch Logs -> Lambda -> S3
-# Sin IRSA ni Pod Identity: Fluent Bit usa las credenciales del rol del nodo
+# Microservicio -> archivo en emptyDir -> sidecar Fluent Bit -> CloudWatch Logs -> Lambda -> S3
+# Sin IRSA ni Pod Identity: el sidecar usa las credenciales del rol del nodo
 # (LabRole) vía IMDS (hop limit 2 en el launch template de los nodos).
-
-resource "kubernetes_namespace_v1" "logging" {
-  metadata { name = "logging" }
-  depends_on = [aws_eks_node_group.this]
-}
 
 resource "aws_cloudwatch_log_group" "backend" {
   name              = "/${local.name}/eks"
@@ -76,41 +71,12 @@ resource "aws_cloudwatch_log_subscription_filter" "to_lambda" {
   depends_on      = [aws_lambda_permission.from_logs]
 }
 
-# ---------- Fluent Bit ----------
-resource "kubernetes_service_account_v1" "fluent_bit" {
+# ---------- Configuración del sidecar Fluent Bit (la usan todos los microservicios) ----------
+# Un log stream por Pod: ${HOSTNAME} es el nombre del Pod (p. ej. order-service-7c9d...).
+resource "kubernetes_config_map_v1" "sidecar" {
   metadata {
-    name      = "fluent-bit"
-    namespace = kubernetes_namespace_v1.logging.metadata[0].name
-  }
-}
-
-resource "kubernetes_cluster_role_v1" "fluent_bit" {
-  metadata { name = "fluent-bit-read" }
-  rule {
-    api_groups = [""]
-    resources  = ["pods", "namespaces"]
-    verbs      = ["get", "list", "watch"]
-  }
-}
-
-resource "kubernetes_cluster_role_binding_v1" "fluent_bit" {
-  metadata { name = "fluent-bit-read" }
-  role_ref {
-    api_group = "rbac.authorization.k8s.io"
-    kind      = "ClusterRole"
-    name      = kubernetes_cluster_role_v1.fluent_bit.metadata[0].name
-  }
-  subject {
-    kind      = "ServiceAccount"
-    name      = kubernetes_service_account_v1.fluent_bit.metadata[0].name
-    namespace = kubernetes_namespace_v1.logging.metadata[0].name
-  }
-}
-
-resource "kubernetes_config_map_v1" "fluent_bit" {
-  metadata {
-    name      = "fluent-bit-config"
-    namespace = kubernetes_namespace_v1.logging.metadata[0].name
+    name      = "fluent-bit-sidecar"
+    namespace = kubernetes_namespace_v1.app.metadata[0].name
   }
 
   data = {
@@ -118,120 +84,20 @@ resource "kubernetes_config_map_v1" "fluent_bit" {
       [SERVICE]
           Flush        5
           Log_Level    info
-          Daemon       Off
-          Parsers_File parsers.conf
 
       [INPUT]
           Name              tail
-          Tag               kube.*
-          Path              /var/log/containers/*_${local.namespace}_*.log
-          multiline.parser  docker, cri
-          DB                /var/fluent-bit/state/flb_kube.db
-          Mem_Buf_Limit     5MB
-          Skip_Long_Lines   On
-          Refresh_Interval  10
-
-      [FILTER]
-          Name                kubernetes
-          Match               kube.*
-          Kube_URL            https://kubernetes.default.svc:443
-          Kube_Tag_Prefix     kube.var.log.containers.
-          Merge_Log           On
-          Keep_Log            Off
-          K8S-Logging.Parser  Off
-          K8S-Logging.Exclude Off
-          Labels              On
-          Annotations         Off
+          Path              /logs/clickstream.log
+          Tag               clickstream
+          Refresh_Interval  5
 
       [OUTPUT]
           Name              cloudwatch_logs
-          Match             kube.*
+          Match             *
           region            ${var.region}
           log_group_name    ${aws_cloudwatch_log_group.backend.name}
-          log_stream_prefix pod-
+          log_stream_name   $${HOSTNAME}
           auto_create_group Off
     EOT
-    "parsers.conf"    = "[PARSER]\n    Name   json\n    Format json\n"
   }
-}
-
-resource "kubernetes_daemon_set_v1" "fluent_bit" {
-  metadata {
-    name      = "fluent-bit"
-    namespace = kubernetes_namespace_v1.logging.metadata[0].name
-    labels    = { app = "fluent-bit" }
-  }
-
-  spec {
-    selector {
-      match_labels = { app = "fluent-bit" }
-    }
-
-    template {
-      metadata {
-        labels = { app = "fluent-bit" }
-        annotations = {
-          config-hash = sha1(jsonencode(kubernetes_config_map_v1.fluent_bit.data))
-        }
-      }
-
-      spec {
-        service_account_name = kubernetes_service_account_v1.fluent_bit.metadata[0].name
-
-        toleration {
-          operator = "Exists"
-        }
-
-        container {
-          name  = "fluent-bit"
-          image = var.fluent_bit_image
-
-          resources {
-            requests = { cpu = "50m", memory = "64Mi" }
-            limits   = { memory = "200Mi" }
-          }
-
-          volume_mount {
-            name       = "config"
-            mount_path = "/fluent-bit/etc/fluent-bit.conf"
-            sub_path   = "fluent-bit.conf"
-          }
-          volume_mount {
-            name       = "config"
-            mount_path = "/fluent-bit/etc/parsers.conf"
-            sub_path   = "parsers.conf"
-          }
-          volume_mount {
-            name       = "varlog"
-            mount_path = "/var/log"
-            read_only  = true
-          }
-          volume_mount {
-            name       = "state"
-            mount_path = "/var/fluent-bit/state"
-          }
-        }
-
-        volume {
-          name = "config"
-          config_map {
-            name = kubernetes_config_map_v1.fluent_bit.metadata[0].name
-          }
-        }
-        volume {
-          name = "varlog"
-          host_path { path = "/var/log" }
-        }
-        volume {
-          name = "state"
-          host_path {
-            path = "/var/fluent-bit/state"
-            type = "DirectoryOrCreate"
-          }
-        }
-      }
-    }
-  }
-
-  depends_on = [aws_cloudwatch_log_group.backend]
 }

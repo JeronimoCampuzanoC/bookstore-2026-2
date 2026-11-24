@@ -50,3 +50,6 @@ database/rds/bootstrap.env
 
 # Course documents (kept outside the repository)
 docs/
+
+# Cloudflare Wrangler
+.wrangler/
